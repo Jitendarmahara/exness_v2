@@ -1,6 +1,6 @@
-import { AssetType, calculatepnl, OpenOrders, type, UserState, type OpenOrdersDetails } from "./route/order";
+import { AssetType, calculatePnL, OpenOrders, OrderType, UserState, type OpenOrdersDetails } from "./route/order";
 
-const LIQUIDATION_THRESHOLD = 0.90; // Changed to 0.90 (liquidate when 90% lost)
+const LIQUIDATION_THRESHOLD = 0.90; // Liquidate when 90% of margin is lost
 
 interface PriceData {
     bid: number;
@@ -8,94 +8,92 @@ interface PriceData {
     price: number;
 }
 
-// Close position
-function closeposition(orderId: string, price: number) {
-    const openorder = OpenOrders.findIndex(x => x.orderId === orderId);
-    if (openorder === -1) return;
+// Liquidate position - user gets NOTHING
+function liquidatePosition(orderId: string, price: number) {
+    const orderIndex = OpenOrders.findIndex(x => x.orderId === orderId);
+    if (orderIndex === -1) return;
 
-    const orderdetails = OpenOrders[openorder];
-    if (!orderdetails) return;
-
-    const user = UserState.find(x => x.userId === orderdetails?.userId);
+    const order = OpenOrders[orderIndex];
+    if(!order){
+        return
+    }
+    const user = UserState.find(x => x.userId === order.userId);
     if (!user) return;
 
-    const pnl = calculatepnl(orderdetails, price);
+    const pnl = calculatePnL(order, price);
     
-    // For margin trades: return margin + PnL
-    // For non-margin: return position value + PnL
-    const positionValue = orderdetails.price * orderdetails.qty;
-    const margin = orderdetails.margin || positionValue;
+    user.totalPnL += pnl;
     
-    const amountToReturn = Math.max(0, margin + pnl);
-    user.balance.usd += amountToReturn;
-
-    OpenOrders.splice(openorder, 1);
+    OpenOrders.splice(orderIndex, 1);
+    
+    console.log(`🚨 LIQUIDATED: ${order.type} ${order.asset} | Lost: $${order.margin.toFixed(2)}`);
 }
 
-// Check position updates with bid/ask
-function checkpositionupdates(asset: AssetType, priceData: PriceData) {
-    const AssetOpenOrders = OpenOrders.filter(x => x.asset == asset);
+// Close position normally
+function closePosition(orderId: string, price: number, reason: string) {
+    const orderIndex = OpenOrders.findIndex(x => x.orderId === orderId);
+    if (orderIndex === -1) return;
+
+    const order = OpenOrders[orderIndex];
+    if(!order){
+        return
+    }
+    const user = UserState.find(x => x.userId === order.userId);
+    if (!user) return;
+
+    const pnl = calculatePnL(order, price);
     
-    AssetOpenOrders.forEach(x => {
-        const pnl = calculatepnl(x, priceData.price);
-        const margin_value = x.margin || 0;
+    // ✅ Return margin + PnL
+    user.balance.usd += order.margin + pnl;
+    user.totalPnL += pnl;
+
+    OpenOrders.splice(orderIndex, 1);
+    
+    console.log(`📊 ${reason}: ${order.type} ${order.asset} | P&L: $${pnl.toFixed(2)}`);
+}
+
+// Check position updates
+function checkPositionUpdates(asset: AssetType, priceData: PriceData) {
+    const assetOrders = OpenOrders.filter(x => x.asset === asset);
+    
+    assetOrders.forEach(order => {
+        // Use bid for LONG (exit by selling), ask for SHORT (exit by buying)
+        const currentPrice = order.type === OrderType.LONG ? priceData.bid : priceData.ask;
+        const pnl = calculatePnL(order, currentPrice);
         
-        // Skip non-margin trades for liquidation
-        if (margin_value <= 0) {
-            // Check only stop loss/take profit for non-margin
-            if (x.stoploss) {
-                const hitstoploss = (x.type === type.LONG && priceData.bid <= x.stoploss) || 
-                                   (x.type === type.SHORT && priceData.ask >= x.stoploss);
-                if (hitstoploss) {
-                    const closePrice = x.type === type.LONG ? priceData.bid : priceData.ask;
-                    closeposition(x.orderId, closePrice);
-                    return;
-                }
-            }
+        // 1. CHECK LIQUIDATION
+        const marginLoss = Math.max(0, -pnl);
+        const marginLossRatio = marginLoss / order.margin;
+        
+        if (marginLossRatio >= LIQUIDATION_THRESHOLD) {
+            liquidatePosition(order.orderId, currentPrice);
+            return;
+        }
+        
+        // 2. CHECK STOP LOSS
+        if (order.stoploss !== undefined) {
+            const hitStopLoss = 
+                (order.type === OrderType.LONG && priceData.bid <= order.stoploss) || 
+                (order.type === OrderType.SHORT && priceData.ask >= order.stoploss);
             
-            if (x.takeprofit) {
-                const hittakeprofit = (x.type === type.LONG && priceData.ask >= x.takeprofit) || 
-                                     (x.type === type.SHORT && priceData.bid <= x.takeprofit);
-                if (hittakeprofit) {
-                    const closePrice = x.type === type.LONG ? priceData.ask : priceData.bid;
-                    closeposition(x.orderId, closePrice,);
-                    return;
-                }
-            }
-            return;
-        }
-        
-        // For margin trades: check liquidation
-        const marginLost = Math.max(0, -pnl) / margin_value;
-        
-        if (marginLost >= LIQUIDATION_THRESHOLD) {
-            const closePrice = x.type === type.LONG ? priceData.bid : priceData.ask;
-            closeposition(x.orderId, closePrice,);
-            return;
-        }
-        
-        // Check stop loss for margin trades
-        if (x.stoploss) {
-            const hitstoploss = (x.type === type.LONG && priceData.bid <= x.stoploss) || 
-                               (x.type === type.SHORT && priceData.ask >= x.stoploss);
-            if (hitstoploss) {
-                const closePrice = x.type === type.LONG ? priceData.bid : priceData.ask;
-                closeposition(x.orderId, closePrice,);
+            if (hitStopLoss) {
+                closePosition(order.orderId, currentPrice, "STOP LOSS");
                 return;
             }
         }
         
-        // Check take profit for margin trades
-        if (x.takeprofit) {
-            const hittakeprofit = (x.type === type.LONG && priceData.ask >= x.takeprofit) || 
-                                 (x.type === type.SHORT && priceData.bid <= x.takeprofit);
-            if (hittakeprofit) {
-                const closePrice = x.type === type.LONG ? priceData.ask : priceData.bid;
-                closeposition(x.orderId, closePrice);
+        // 3. CHECK TAKE PROFIT
+        if (order.takeprofit !== undefined) {
+            const hitTakeProfit = 
+                (order.type === OrderType.LONG && priceData.ask >= order.takeprofit) || 
+                (order.type === OrderType.SHORT && priceData.bid <= order.takeprofit);
+            
+            if (hitTakeProfit) {
+                closePosition(order.orderId, currentPrice, "TAKE PROFIT");
                 return;
             }
         }
     });
 }
 
-export { checkpositionupdates };
+export { checkPositionUpdates, closePosition, liquidatePosition };
